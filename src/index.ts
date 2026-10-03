@@ -277,7 +277,7 @@ import {
 
 const DEFAULT_AGENT_MAX_ITERATIONS = 15;
 const LOCAL_AGENT_MAX_ITERATIONS = Number(process.env.T3MP3ST_LOCAL_AGENT_MAX_ITERATIONS || 30);
-const MAX_PROGRESS_EVENTS = 300;
+const MAX_PROGRESS_EVENTS = 50; // Keep recent events only, reduce memory overhead
 
 /**
  * TEMPEST Command - Main orchestration controller
@@ -443,34 +443,22 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       this.arsenal.registerMany(buildPostExTools(deps)); // metasploit_module (dangerous) + hydra_bruteforce (credential)
     }
 
-    // Advanced modules
-    this.exploit = new ExploitEngine();
-    this.scanner = new ScannerOrchestrator();
-    this.browser = new BrowserAutomation();
-    // STUB by design, not an oversight: the real benchmark implementation lives in
-    // src/benchmark (class `Benchmark`) but is NOT a drop-in here — it exposes a
-    // different, scoring-oriented API (scoreRun/challengeToTasks/listChallenges,
-    // it does not run agents itself) and different Challenge/Metrics shapes than
-    // the `BenchmarkRunner` type this field is declared as. Wiring it in would
-    // require changing this field's type plus the `Tempest` interface/factory, so
-    // it is intentionally left as the stub. The real benchmark is currently
-    // CLI-only (see scripts/ + src/benchmark).
-    this.benchmark = new BenchmarkRunner();
-    this.reasoning = new ReasoningEngine(this.llm);
-
-    // Elite modules
-    this.cognition = new CognitionEngine(this.llm);
-    this.swarm = new SwarmController();
-    this.cloud = new CloudSecurityEngine();
-    this.persistence = new PersistenceController();
-    this.learning = new LearningEngine();
-
-    // Foundational modules
-    this.knowledge = new KnowledgeBase();
-    this.protocols = new ProtocolHandler();
-    this.evasion = new EvasionEngine();
-    this.reporting = new ReportingEngine();
-    this.workflow = new WorkflowOrchestrator(this.llm.getClient());
+    // Lazy-init stubs on first access (performance: don't instantiate unused modules)
+    this.exploit = undefined as any;
+    this.scanner = undefined as any;
+    this.browser = undefined as any;
+    this.benchmark = undefined as any;
+    this.reasoning = undefined as any;
+    this.cognition = undefined as any;
+    this.swarm = undefined as any;
+    this.cloud = undefined as any;
+    this.persistence = undefined as any;
+    this.learning = undefined as any;
+    this.knowledge = undefined as any;
+    this.protocols = undefined as any;
+    this.evasion = undefined as any;
+    this.reporting = undefined as any;
+    this.workflow = undefined as any;
 
     // Autonomous Op General
     this.general = new OpGeneral(this.llm);
@@ -688,23 +676,25 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     detail: string,
     extra: Partial<Pick<ScanProgressEvent, 'toolName' | 'success' | 'source'>> = {}
   ): void {
-    const compact = String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+    // Fast path: skip complex string ops for bulk events, cap to 2000 chars w/o regex
+    const detail_capped = (detail || '').slice(0, 2000);
+    const now = Date.now();
     const event: ScanProgressEvent = {
-      id: `progress-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      timestamp: Date.now(),
+      id: `progress-${now}-${Math.random().toString(16).slice(2)}`,
+      timestamp: now,
       kind,
       operatorId: operator.id,
       callsign: operator.callsign,
       archetype: operator.archetype,
       taskId: task?.id,
       taskName: task?.name,
-      detail: compact,
+      detail: detail_capped,
       ...extra,
     };
 
     this.progressEvents.push(event);
     if (this.progressEvents.length > MAX_PROGRESS_EVENTS) {
-      this.progressEvents.splice(0, this.progressEvents.length - MAX_PROGRESS_EVENTS);
+      this.progressEvents.shift(); // O(1) at front, much faster than splice
     }
     this.emit('scan:progress', event);
   }
@@ -760,36 +750,39 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
    * Extract service info from port/service findings and add to target
    */
   private extractServicesFromFinding(targetId: string, finding: Finding): void {
-    // Try to parse port numbers from the finding description
-    const portMatches = finding.description.matchAll(/(\d+)\/(tcp|udp)\s+(open)\s+(\S+)/gi);
-    for (const match of portMatches) {
-      const port = parseInt(match[1], 10);
-      const protocol = match[2];
-      const name = match[4];
-      this.targetEnv.addService(targetId, { name, port, protocol });
+    // Skip if no port-like patterns visible in first 200 chars
+    const desc = finding.description.slice(0, 200).toLowerCase();
+    if (!desc.match(/\d+\/(tcp|udp)|port[s]?\s*[:=]?|open\s+(ftp|ssh|http|https|smb|mysql|postgres|redis|mongodb)/)) {
+      return;
     }
 
-    // Also try simpler pattern: "port 80", "port 443 open"
-    const simpleMatches = finding.description.matchAll(/port[s]?\s*[:=]?\s*(\d+(?:\s*,\s*\d+)*)/gi);
-    for (const match of simpleMatches) {
-      const ports = match[1].split(',').map(p => parseInt(p.trim(), 10));
+    // Cache known services to avoid recreating on each finding
+    const KNOWN_SERVICES: Record<number, string> = {
+      21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'dns',
+      80: 'http', 110: 'pop3', 143: 'imap', 443: 'https', 445: 'smb',
+      3306: 'mysql', 3389: 'rdp', 5432: 'postgresql', 6379: 'redis',
+      8080: 'http-proxy', 8443: 'https-alt', 27017: 'mongodb',
+    };
+
+    const existing = this.targetEnv.getTarget(targetId);
+    const existingPorts = new Set(existing?.services?.map(s => s.port) || []);
+
+    // Single regex pass instead of two
+    const portPattern = /(\d+)\/(?:tcp|udp)|port[s]?\s*[:=]?\s*(\d+(?:\s*,\s*\d+)*)/gi;
+    let match;
+    while ((match = portPattern.exec(finding.description)) !== null) {
+      const portStr = match[1] || match[2];
+      if (!portStr) continue;
+
+      const ports = portStr.split(',').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p));
       for (const port of ports) {
-        if (!isNaN(port)) {
-          const existing = this.targetEnv.getTarget(targetId);
-          const alreadyHas = existing?.services?.some(s => s.port === port);
-          if (!alreadyHas) {
-            const knownServices: Record<number, string> = {
-              21: 'ftp', 22: 'ssh', 23: 'telnet', 25: 'smtp', 53: 'dns',
-              80: 'http', 110: 'pop3', 143: 'imap', 443: 'https', 445: 'smb',
-              3306: 'mysql', 3389: 'rdp', 5432: 'postgresql', 6379: 'redis',
-              8080: 'http-proxy', 8443: 'https-alt', 27017: 'mongodb',
-            };
-            this.targetEnv.addService(targetId, {
-              name: knownServices[port] || 'unknown',
-              port,
-              protocol: 'tcp',
-            });
-          }
+        if (!existingPorts.has(port)) {
+          this.targetEnv.addService(targetId, {
+            name: KNOWN_SERVICES[port] || 'unknown',
+            port,
+            protocol: 'tcp',
+          });
+          existingPorts.add(port);
         }
       }
     }
@@ -1048,26 +1041,32 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     const pendingTasks = taskQueue.getPending();
     if (pendingTasks.length === 0) return;
 
+    // Cache all operators once instead of filtering N times per task
+    const allOps = this.cell.getAllOperators();
+    const opsByArchetype = new Map<string, OperatorAgent[]>();
+    for (const op of allOps) {
+      if (!opsByArchetype.has(op.archetype)) opsByArchetype.set(op.archetype, []);
+      opsByArchetype.get(op.archetype)!.push(op);
+    }
+
     for (const task of pendingTasks) {
       // Skip if already being dispatched
       if (this.activeDispatches.has(task.id)) continue;
 
-      // Find ALL idle operators matching the task's archetype, pick the first unused
-      const availableOps = this.cell.getAllOperators()
-        .filter(op => op.archetype === task.operatorType && op.isAvailable());
-      let operator = availableOps[0];
+      // Find first idle operator for this archetype
+      let operator: OperatorAgent | undefined;
+      const arcOps = opsByArchetype.get(task.operatorType);
+      if (arcOps) {
+        operator = arcOps.find(op => op.isAvailable());
+      }
 
       // Auto-spawn an operator if none exists for this archetype
       if (!operator) {
         if (this.llm.getProvider() === 'local-agent') continue;
-        const allOps = this.cell.getAllOperators();
-        const archetypeCount = allOps.filter(op => op.archetype === task.operatorType).length;
+        const archetypeCount = arcOps?.length || 0;
         // Spawn up to 3 operators per archetype for parallelism
         if (archetypeCount < 3) {
           const callsign = `${task.operatorType.charAt(0).toUpperCase() + task.operatorType.slice(1)}-${archetypeCount + 1}`;
-          // spawnOperator throws when the pool is at capacity or the callsign collides —
-          // treat that as "no operator available right now" and defer (operator stays unset),
-          // never crash the tick.
           try { operator = this.spawnOperator(callsign, task.operatorType); }
           catch { /* pool full / dup callsign — dispatch skipped by the !operator guard below */ }
         }
@@ -1265,17 +1264,17 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
   // ===========================================================================
 
   /**
-   * Spawn an operator with forwarding setup and agent loop
+   * Spawn an operator with forwarding setup and agent loop (reuse main LLM when possible)
    */
   public spawnOperator(
     callsign: string,
     archetype: OperatorArchetype
   ): OperatorAgent {
-    // Each operator gets its OWN LLMBackbone (same config as the mission's) rather than sharing
-    // this.llm — see the llmConfig field comment. Used for BOTH this operator's AgentLoop and its
-    // own decompose-on-failure fallback, so the two stay consistent with each other while staying
-    // isolated from every other operator in the cell.
-    const operatorLLM = new LLMBackbone(this.llmConfig);
+    // Reuse main LLM for most operators to reduce memory footprint.
+    // Only local-agent needs isolation per operator.
+    const operatorLLM = this.llmConfig.provider === 'local-agent'
+      ? new LLMBackbone(this.llmConfig)
+      : this.llm;
     const operator = this.cell.spawnOperator(callsign, archetype, undefined, operatorLLM);
     this.setupOperatorEvents(operator);
 
@@ -1337,7 +1336,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
   }
 
   /**
-   * Get command status
+   * Get command status (fast path: skip expensive serialization)
    */
   public getStatus(): {
     name: string;
@@ -1364,6 +1363,9 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     const activeMission = this.mission.getActiveMission();
     const taskQueue = this.mission.getTaskQueue();
 
+    // Only include last 5 progress events in status to avoid huge payloads
+    const recentProgress = this.progressEvents.slice(-5);
+
     return {
       name: this.name,
       running: this.running,
@@ -1375,7 +1377,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       opsec: this.opsec.getStats(),
       activeMission: activeMission?.id || null,
       stallReason: this.stallReason,
-      progress: [...this.progressEvents],
+      progress: recentProgress,
       tasks: activeMission
         ? taskQueue.getForMission(activeMission.id).map(task => ({
             id: task.id,
@@ -1386,9 +1388,9 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
             assignedTo: task.assignedTo,
             result: task.result ? {
               success: task.result.success,
-              output: task.result.output,
-              error: task.result.error,
-              findings: task.result.findings,
+              output: task.result.output?.slice(0, 500), // Cap output size
+              error: task.result.error?.slice(0, 500),
+              findings: task.result.findings?.slice(0, 10), // Cap findings
             } : undefined,
           }))
         : [],

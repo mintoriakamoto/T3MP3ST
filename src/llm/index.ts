@@ -115,10 +115,18 @@ function estimateTokens(messages: LLMMessage[]): number {
   return Math.ceil(chars / 4);
 }
 
+// Cache throttle config to avoid repeated env lookups
+let throttleConfig: { tpmLimit: number; minInterval: number; maxWait: number } | null = null;
+
 async function throttleLLMRequest(messages: LLMMessage[]): Promise<void> {
-  const tpmLimit = Number(process.env.T3MP3ST_LLM_TPM_LIMIT || '0');
-  const minInterval = Number(process.env.T3MP3ST_LLM_MIN_INTERVAL_MS || '0');
-  const maxWait = Number(process.env.T3MP3ST_LLM_MAX_WAIT_MS || (5 * 60 * 1000));
+  if (!throttleConfig) {
+    const tpmLimit = Number(process.env.T3MP3ST_LLM_TPM_LIMIT || '0');
+    const minInterval = Number(process.env.T3MP3ST_LLM_MIN_INTERVAL_MS || '0');
+    const maxWait = Number(process.env.T3MP3ST_LLM_MAX_WAIT_MS || (5 * 60 * 1000));
+    throttleConfig = { tpmLimit, minInterval, maxWait };
+  }
+
+  const { tpmLimit, minInterval, maxWait } = throttleConfig;
   if (!tpmLimit && !minInterval) return;
 
   const now = Date.now();
@@ -127,9 +135,11 @@ async function throttleLLMRequest(messages: LLMMessage[]): Promise<void> {
 
   while (Date.now() < deadline) {
     const cut = Date.now() - throttleWindowMs;
-    for (let i = throttleState.length - 1; i >= 0; i--) {
-      if (throttleState[i].at < cut) throttleState.splice(i, 1);
+    // Fast remove old entries from front (they're in chronological order)
+    while (throttleState.length > 0 && throttleState[0].at < cut) {
+      throttleState.shift();
     }
+
     const used = throttleState.reduce((sum, s) => sum + s.tokens, 0);
     const lastCall = throttleState.length ? throttleState[throttleState.length - 1].at : 0;
 
