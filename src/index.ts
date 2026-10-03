@@ -275,8 +275,8 @@ import {
 // TEMPEST COMMAND
 // =============================================================================
 
-const DEFAULT_AGENT_MAX_ITERATIONS = Number(process.env.T3MP3ST_AGENT_MAX_ITERATIONS || 100);
-const LOCAL_AGENT_MAX_ITERATIONS = Number(process.env.T3MP3ST_LOCAL_AGENT_MAX_ITERATIONS || 200);
+const DEFAULT_AGENT_MAX_ITERATIONS = 15;
+const LOCAL_AGENT_MAX_ITERATIONS = Number(process.env.T3MP3ST_LOCAL_AGENT_MAX_ITERATIONS || 30);
 const MAX_PROGRESS_EVENTS = 50; // Keep recent events only, reduce memory overhead
 
 /**
@@ -361,8 +361,8 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
   private readonly coordinationEnabled = !/^(0|false|off)$/i.test(process.env.T3MP3ST_SWARM_COORD ?? '1');
   /** Findings that already spawned a follow-up (dedup — a finding chases exactly once). */
   private readonly spawnedFollowups = new Set<string>();
-  /** Per-run cap on follow-up tasks (unlimited by default). */
-  private readonly maxFollowups = Number(process.env.T3MP3ST_SWARM_MAX_FOLLOWUPS) || Infinity;
+  /** Per-run cap on follow-up tasks so the refinement loop can never explode. */
+  private readonly maxFollowups = Number(process.env.T3MP3ST_SWARM_MAX_FOLLOWUPS) || 24;
   /** Coordination telemetry — the artifact that distinguishes a coordinated run from N solo agents. */
   private leadsPosted = 0;
   private followupsSpawned = 0;
@@ -377,8 +377,8 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     this.llmConfig = config.llm;
     this.llm = new LLMBackbone(config.llm);
 
-    // Initialize core subsystems (no concurrency limits)
-    this.cell = new OperatorCell(config.operators?.maxConcurrent || 1000, this.llm);
+    // Initialize core subsystems
+    this.cell = new OperatorCell(config.operators?.maxConcurrent || 10, this.llm);
     this.mission = new MissionControl();
     this.targetEnv = new TargetEnvironment();
     this.vault = new EvidenceVault();
@@ -653,7 +653,8 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     detail: string,
     extra: Partial<Pick<ScanProgressEvent, 'toolName' | 'success' | 'source'>> = {}
   ): void {
-    // Keep full detail (no capping)
+    // Fast path: skip complex string ops for bulk events, cap to 2000 chars w/o regex
+    const detail_capped = (detail || '').slice(0, 2000);
     const now = Date.now();
     const event: ScanProgressEvent = {
       id: `progress-${now}-${Math.random().toString(16).slice(2)}`,
@@ -664,7 +665,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       archetype: operator.archetype,
       taskId: task?.id,
       taskName: task?.name,
-      detail: detail || '',
+      detail: detail_capped,
       ...extra,
     };
 
@@ -898,17 +899,18 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
   private progressEvents: ScanProgressEvent[] = [];
 
   /**
-   * Resolve the dispatch timeout from the environment (unlimited by default).
-   * Guards against a non-numeric / non-positive override.
+   * Resolve the dispatch timeout from the environment, falling back to the
+   * provider-specific default. Guards against a non-numeric / non-positive override.
    */
   private static resolveTaskTimeoutMs(provider?: LLMProvider): number {
-    const DEFAULT_TASK_TIMEOUT_MS = Infinity; // No time limit
+    const DEFAULT_TASK_TIMEOUT_MS = 300000; // 5 minutes — generous backstop, not a deadline
+    const LOCAL_AGENT_TASK_TIMEOUT_MS = 1800000; // local CLI agents can need multiple slow turns
     const raw = process.env.T3MP3ST_TASK_TIMEOUT_MS;
     if (raw != null && raw.trim() !== '') {
       const parsed = Number(raw);
       if (Number.isFinite(parsed) && parsed > 0) return parsed;
     }
-    return DEFAULT_TASK_TIMEOUT_MS;
+    return provider === 'local-agent' ? LOCAL_AGENT_TASK_TIMEOUT_MS : DEFAULT_TASK_TIMEOUT_MS;
   }
 
   /** Track whether we've seeded initial tasks for the current mission */
@@ -926,7 +928,11 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     this.tickCount++;
     this.emit('tick', this.tickCount);
 
-    // OPSEC abort checks disabled (run full speed)
+    // Check OPSEC status
+    if (this.opsec.isAbortRecommended()) {
+      this.pause();
+      return;
+    }
 
     // Get active mission
     const mission = this.mission.getActiveMission();
@@ -1031,13 +1037,16 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
         operator = arcOps.find(op => op.isAvailable());
       }
 
-      // Auto-spawn an operator if none exists for this archetype (no limits)
+      // Auto-spawn an operator if none exists for this archetype
       if (!operator) {
         if (this.llm.getProvider() === 'local-agent') continue;
         const archetypeCount = arcOps?.length || 0;
-        const callsign = `${task.operatorType.charAt(0).toUpperCase() + task.operatorType.slice(1)}-${archetypeCount + 1}`;
-        try { operator = this.spawnOperator(callsign, task.operatorType); }
-        catch { /* pool full / dup callsign — dispatch skipped by the !operator guard below */ }
+        // Spawn up to 3 operators per archetype for parallelism
+        if (archetypeCount < 3) {
+          const callsign = `${task.operatorType.charAt(0).toUpperCase() + task.operatorType.slice(1)}-${archetypeCount + 1}`;
+          try { operator = this.spawnOperator(callsign, task.operatorType); }
+          catch { /* pool full / dup callsign — dispatch skipped by the !operator guard below */ }
+        }
         if (!operator) continue;
       }
 
@@ -1254,7 +1263,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       : DEFAULT_AGENT_MAX_ITERATIONS;
     const agentLoop = new AgentLoop(operatorLLM, this.arsenal, {
       maxIterations,
-      maxTokens: Infinity, // No token limit
+      maxTokens: 50000,
       toolCategories: profile.toolCategories,
       tools: profile.defaultTools,
     });
@@ -1331,6 +1340,9 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
     const activeMission = this.mission.getActiveMission();
     const taskQueue = this.mission.getTaskQueue();
 
+    // Only include last 5 progress events in status to avoid huge payloads
+    const recentProgress = this.progressEvents.slice(-5);
+
     return {
       name: this.name,
       running: this.running,
@@ -1342,7 +1354,7 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
       opsec: this.opsec.getStats(),
       activeMission: activeMission?.id || null,
       stallReason: this.stallReason,
-      progress: [...this.progressEvents], // All events, no capping
+      progress: recentProgress,
       tasks: activeMission
         ? taskQueue.getForMission(activeMission.id).map(task => ({
             id: task.id,
@@ -1353,9 +1365,9 @@ export class TempestCommand extends EventEmitter<CommandEvents> {
             assignedTo: task.assignedTo,
             result: task.result ? {
               success: task.result.success,
-              output: task.result.output, // Full output
-              error: task.result.error,
-              findings: task.result.findings, // All findings
+              output: task.result.output?.slice(0, 500), // Cap output size
+              error: task.result.error?.slice(0, 500),
+              findings: task.result.findings?.slice(0, 10), // Cap findings
             } : undefined,
           }))
         : [],
